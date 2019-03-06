@@ -1,15 +1,30 @@
 -module(tcp_acceptor).
 
+% temporary, for dev only
+-include("deps/teaser/include/utils.hrl").
+
 % export public API
--export([start/0]).
--export([stop/0]).
+-export([start/0, start/1]).
+-export([stop/0, stop/1]).
 
 % export internal server-routine API
--export([init/1]).
+-export([server_loop/1]).
 
 % =================== specs, records, constants, defaults =======================
 
-% defaults
+% options accepted by start/1
+-type options() :: #{
+    'REG_NAME'                  => atom(),
+    'START_ATTEMPTS'            => pos_integer(),
+    'START_TIMEOUT_PER_ATTEMPT' => non_neg_integer(),
+    'SHUTDOWN_TIMEOUT'          => non_neg_integer(),
+    'PORT'                      => non_neg_integer(),
+    'LISTEN_OPTIONS'            => [gen_tcp:listen_option()],
+    'HANDLER'                   => fun(),
+    'INIT_STATE'                => conn_state()
+}.
+
+% defaults (in case of some options not set)
 -define(DEFAULT_OPTIONS,
     [
         % registered name of socket-listener server
@@ -23,31 +38,24 @@
         % listen options "on init"
         {'LISTEN_OPTIONS',  ['binary', {active, false}, {packet, 4}]},
         % function to handle frames and manipulate current receiver state
-        {'HANDLER', fun dump_frame/2}
+        {'HANDLER', fun dump_frame/2},
+        % init value of connection state
+        {'INIT_STATE', <<>>}
     ]
 ).
 
 -define(SHUTDOWN_TIMEOUT, 1000).
 
--type options() :: #{
-    'REG_NAME'                  => atom(),
-    'START_ATTEMPTS'            => pos_integer(),
-    'START_TIMEOUT_PER_ATTEMPT' => non_neg_integer(),
-    'SHUTDOWN_TIMEOUT'          => non_neg_integer(),
-    'PORT'                      => non_neg_integer(),
-    'LISTEN_OPTIONS'            => [gen_tcp:listen_option()],
-    'HANDLER'                   => fun()
-}.
-
 -record(state,  {
-        l_socket        :: gen_tcp:socket(),
+        l_socket        :: 'undefined' | gen_tcp:socket(),
         options         :: options(),
         ready = false   :: boolean()
     }).
-%-type state()       :: #state{}.
+-type state()           :: #state{}.
 
--type error()       :: {'error', reason()}.
--type reason()      :: term().
+-type error()           :: {'error', reason()}.
+-type reason()          :: term().
+-type conn_state()      :: term().
 
 % ------------- end of specs, records, constants, defaults ----------------------
 
@@ -55,47 +63,112 @@
 % =============================== public api part ===============================
 
 % @doc
-% We returning from here only once acceptor ready to accept new connections.
+% Interface for start tcp_acceptor with default options
+% Start is synchronous. We returning from start once first acceptor is ready.
 % @end
--spec start() -> {'ok', pid()} | error().
+
+-spec start() -> Result when
+    Result  ::  {'ok', pid()} | error().
 
 start() -> start(#{}).
 
+
+% @doc
+% Interface for start tcp_acceptor with custom options
+% Start is synchronous. We returning from start once first acceptor is ready.
+% @end
+
+-spec start(Options) -> Result when
+    Options ::  options(),
+    Result  ::  {'ok', pid()} | error().
+
 start(Options) ->
     CompletedOps = assign_defaults(Options),
+    Pid = spawn_link(?MODULE, server_loop, [#state{options = CompletedOps}]),
     RegName = maps:get('REG_NAME', CompletedOps),
-    case whereis(RegName) of
-        'undefined' ->
-            Pid = spawn_link(?MODULE, init, [CompletedOps]),
-            case is_ready(
-                    Pid,
-                    maps:get('START_TIMEOUT_PER_ATTEMPT', CompletedOps),
-                    maps:get('START_TIMEOUT_PER_ATTEMPT', CompletedOps)*(maps:get('START_ATTEMPTS', CompletedOps) + 1),
-                    maps:get('START_ATTEMPTS', CompletedOps),
-                    0
-                ) of
+    try register(RegName, Pid) of
+        true ->
+            case init(Pid, CompletedOps) of
                 true ->
-                    register(RegName, Pid),
                     {'ok', Pid};
                 false ->
-                    stop(Pid),
+                    _ = stop(Pid),
                     {error, 'acceptor_not_responding'}
-            end;
-        Pid ->
-            {error, {'already_registered', Pid}}
+            end
+        catch error:_ ->
+            {error, {'already_registered', whereis(RegName)}}
     end.
 
-assign_defaults(Options) ->
-    lists:foldl(
-        fun({Key, Value}, Acc) ->
-            maps:put(Key, maps:get(Key, Acc, Value), Acc)
-        end,
-        Options,
-        ?DEFAULT_OPTIONS
-    ).
+% @doc
+% API for shutdown tcp_acceptor gracefully.
+% Stop is synchronous. We returning from stop once get confirmation that tcp_acceptor is down.
+% @end
+
+% todo: implement force-kill routine in case of we do not get shutdown message in some amount of time
+-spec stop() -> Result when
+    Result  ::  'ok' | error().
+
+stop() -> stop(?MODULE).
+
+-spec stop(PidOrRegisterdName) -> Result when
+    PidOrRegisterdName  :: pid() | atom(),
+    Result              :: 'ok' | error().
+
+stop('undefined') -> ok;
+stop(RegisteredName) when is_atom(RegisteredName) ->
+    stop(whereis(?MODULE));
+stop(Pid) ->
+    process_flag(trap_exit, true),
+    erlang:monitor(process, Pid),
+    exit(Pid, shutdown),
+    receive
+    	{'DOWN', _MRef, process, Pid, _Reason} ->
+    	    'ok'
+    after ?SHUTDOWN_TIMEOUT ->
+        {'error', timeout}
+    end.
+
+% ------------------------- end of public api part ------------------------------
+
+% ================================ internals ====================================
+
+% server_loop. once we got shutdown message we have to close the socket
+-spec server_loop(State) -> Result when
+    State   :: state(),
+    Result  :: no_return() | 'ok'.
+
+server_loop(State) ->
+    receive
+        'init' ->
+            Options = State#state.options,
+            {ok, LSocket} = gen_tcp:listen(maps:get('PORT', Options), maps:get('LISTEN_OPTIONS', Options)),
+            SocketOwner = self(),
+            _ = spawn(fun() -> acceptor(LSocket, Options, SocketOwner) end),
+            server_loop(State#state{l_socket = LSocket});
+        'acceptor_ready' ->
+            server_loop(State#state{ready = true});
+        {'is_ready?', ReportTo} ->
+            ReportTo ! {'ready', State#state.ready},
+            server_loop(State);
+        {'EXIT', _Pid, 'shutdown'} ->
+            gen_tcp:close(State#state.l_socket);
+        _Other -> % ignoring other messages yet
+            server_loop(State)
+    end.
 
 
-% @doc check does any acceptor is ready
+% init server
+-spec init(Pid, Options) -> Result when
+    Pid                 :: pid(),
+    Options             :: options(),
+    Result              :: boolean().
+
+init(Pid, #{'START_TIMEOUT_PER_ATTEMPT' := Timeout, 'START_ATTEMPTS' := MAX_ATTEMPTS}) ->
+    Pid ! 'init',
+    is_ready(Pid, Timeout, Timeout * (MAX_ATTEMPTS + 1), MAX_ATTEMPTS, 0).
+
+
+% check does acceptor is ready or not
 -spec is_ready(Pid, TimeoutPerAttempt, TotalTimeout, MaxAttempts, CurrentAttempts) -> Result when
     Pid                 :: pid(),
     TimeoutPerAttempt   :: non_neg_integer(),
@@ -119,77 +192,42 @@ is_ready(Pid, Timeout, TotalTimeout, MaxAttempts, Attempts) ->
     end.
 
 
-% @doc
-% Synchronous API for shutdown listener-process gracefully.
-% todo: implement force-kill in case of we do not get shutdown message in some amount of time
-% @end
--spec stop() -> 'ok' | error().
-
-stop() -> stop(?MODULE).
-
-stop('undefined') -> ok;
-stop(RegisteredName) when is_atom(RegisteredName) ->
-    stop(whereis(?MODULE));
-stop(Pid) ->
-    erlang:monitor(process, Pid),
-    exit(Pid, shutdown),
-    receive
-    	{'DOWN', _MRef, process, Pid, _Reason} ->
-    	    'ok'
-    after ?SHUTDOWN_TIMEOUT ->
-        {'error', timeout}
-    end.
-
-% =============================== public api part ===============================
-
-
-% ------------------------- end of public api part ------------------------------
-
-% init section of server
-init(#{'PORT' := Port, 'LISTEN_OPTIONS' := ListenOptions} = Options) ->
-    {ok, LSocket} = gen_tcp:listen(Port, ListenOptions),
-    SocketOwner = self(),
-    spawn(fun() -> acceptor(LSocket, Options, SocketOwner) end),
-    server_loop(#state{l_socket = LSocket, options = Options}).
-
-% server_loop. once we got shutdown message we have to close the socket
-server_loop(State) ->
-    receive
-        'acceptor_ready' ->
-            server_loop(State#state{ready = true});
-        {'is_ready?', ReportTo} ->
-            ReportTo ! {'ready', State#state.ready},
-            server_loop(State);
-        {'EXIT', _Pid, 'shutdown'} ->
-            gen_tcp:close(State#state.l_socket);
-        _Other -> % ignoring other messages yet
-            server_loop(State)
-    end.
-
 % connection acceptor
+-spec acceptor(LSocket, Options, ReportStartTo) -> Result when
+    LSocket         :: gen_tcp:socket(),
+    Options         :: options(),
+    ReportStartTo   :: pid() | 'undefined',
+    Result          :: no_return() | 'ok'.
+
 acceptor(LSocket, Options, ReportStartTo) ->
-    may_report(ReportStartTo),
+    _ = may_report(ReportStartTo),
     case gen_tcp:accept(LSocket) of
         {'ok', ASocket} ->
-            spawn(fun() -> acceptor(LSocket, Options, false) end),
-            acceptor_loop(ASocket, Options, 'undefined');
+            spawn(fun() -> acceptor(LSocket, Options, 'undefined') end),
+            acceptor_loop(ASocket, Options, maps:get('INIT_STATE', Options));
         _Other ->
-            ok
+            'ok'
     end.
+
 
 % on the first init we going report to the server
 % that acceptor spawned succesfully and ready to gen_tcp:accept
 -spec may_report(PidOrFalse) -> Result when
-    PidOrFalse  :: pid() | false,
-    Result      :: ok.
+    PidOrFalse  :: pid() | 'undefined',
+    Result      :: atom().
 
-may_report(false) -> ok;
+may_report('undefined') -> 'ok';
 may_report(Pid) -> Pid ! 'acceptor_ready'.
 
-
 % accepting messages in loop
+-spec acceptor_loop(Socket, Options, State) -> Result when
+    Socket  :: gen_tcp:socket(),
+    Options :: options(),
+    State   :: conn_state(),
+    Result  :: no_return() | 'ok'.
+
 acceptor_loop(Socket, #{'HANDLER' := Handler} = Options, State) ->
-    inet:setopts(Socket, [{active, once}]),
+    ok = inet:setopts(Socket, [{active, once}]),
     receive
         {'tcp', Socket, Data} ->
             acceptor_loop(
@@ -201,11 +239,32 @@ acceptor_loop(Socket, #{'HANDLER' := Handler} = Options, State) ->
             ok
     end.
 
+
 % default function for handle frames
-dump_frame(Frame, _State) ->
+-spec dump_frame(Frame, State) -> Result when
+    Frame   :: term(),
+    State   :: conn_state(),
+    Result  :: conn_state().
+
+dump_frame(Frame, State) ->
     io:format("~p",[
         string:tokens(binary_to_list(Frame),"\r\n")
-    ]).
+    ]), State.
+
+
+% helper function for assign default values to options
+-spec assign_defaults(Options) -> Result when
+    Options :: options(),
+    Result  :: options().
+
+assign_defaults(Options) ->
+    lists:foldl(
+        fun({Key, Value}, Acc) ->
+            maps:put(Key, maps:get(Key, Acc, Value), Acc)
+        end,
+        Options,
+        ?DEFAULT_OPTIONS
+    ).
 
 % ---------------------------- end of internals ---------------------------------
 
