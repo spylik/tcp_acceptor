@@ -1,8 +1,5 @@
 -module(tcp_acceptor).
 
-% temporary, for dev only
--include("deps/teaser/include/utils.hrl").
-
 % export public API
 -export([start/0, start/1]).
 -export([stop/0, stop/1]).
@@ -10,6 +7,8 @@
 % export internal server-routine API
 -export([server_loop/1]).
 
+% temporary for debugging
+-include("deps/teaser/include/utils.hrl").
 % =================== specs, records, constants, defaults =======================
 
 % options accepted by start/1
@@ -84,7 +83,7 @@ start() -> start(#{}).
 
 start(Options) ->
     CompletedOps = assign_defaults(Options),
-    Pid = spawn_link(?MODULE, server_loop, [#state{options = CompletedOps}]),
+    Pid = spawn(?MODULE, server_loop, [#state{options = CompletedOps}]),
     RegName = maps:get('REG_NAME', CompletedOps),
     try register(RegName, Pid) of
         true ->
@@ -116,14 +115,18 @@ stop() -> stop(?MODULE).
 
 stop('undefined') -> ok;
 stop(RegisteredName) when is_atom(RegisteredName) ->
-    stop(whereis(?MODULE));
+    stop(whereis(RegisteredName));
 stop(Pid) ->
-    process_flag(trap_exit, true),
-    erlang:monitor(process, Pid),
+    MRef = erlang:monitor(process, Pid),
     exit(Pid, shutdown),
     receive
-    	{'DOWN', _MRef, process, Pid, _Reason} ->
-    	    'ok'
+    	{'DOWN', MRef, process, Pid, _Reason} ->
+    	    'ok';
+        {'EXIT', Pid, shutdown} ->
+    	    'ok';
+        Other ->
+            error_logger:warning_msg("Some unexpected message got at ~p(~p): ~p",[?MODULE, ?LINE, Other]),
+            {'error', {'unexpected_message', Other}}
     after ?SHUTDOWN_TIMEOUT ->
         {'error', timeout}
     end.
@@ -152,7 +155,8 @@ server_loop(State) ->
             server_loop(State);
         {'EXIT', _Pid, 'shutdown'} ->
             gen_tcp:close(State#state.l_socket);
-        _Other -> % ignoring other messages yet
+        Other -> % ignoring other messages yet
+            error_logger:warning_msg("Some unexpected message got at ~p(~p): ~p",[?MODULE, ?LINE, Other]),
             server_loop(State)
     end.
 
