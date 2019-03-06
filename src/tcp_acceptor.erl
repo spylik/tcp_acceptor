@@ -37,7 +37,7 @@
         % listen options "on init"
         {'LISTEN_OPTIONS',  ['binary', {active, false}, {packet, 4}]},
         % function to handle frames and manipulate current receiver state
-        {'HANDLER', fun dump_frame/2},
+        {'HANDLER', fun dump_frame/3},
         % init value of connection state
         {'INIT_STATE', <<>>}
     ]
@@ -237,7 +237,7 @@ acceptor_loop(Socket, #{'HANDLER' := Handler} = Options, State) ->
             acceptor_loop(
                 Socket,
                 Options,
-                erlang:apply(Handler, [Data, State])
+                erlang:apply(Handler, [Socket, Data, State])
             );
         {'tcp_closed', Socket} ->
             ok
@@ -245,12 +245,13 @@ acceptor_loop(Socket, #{'HANDLER' := Handler} = Options, State) ->
 
 
 % default function for handle frames
--spec dump_frame(Frame, State) -> Result when
+-spec dump_frame(Socket, Frame, State) -> Result when
+    Socket  :: gen_tcp:socket(),
     Frame   :: term(),
     State   :: conn_state(),
     Result  :: conn_state().
 
-dump_frame(Frame, State) ->
+dump_frame(_Socket, Frame, State) ->
     io:format("~p",[
         string:tokens(binary_to_list(Frame),"\r\n")
     ]), State.
