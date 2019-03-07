@@ -4,8 +4,6 @@
 -export([start/0, start/1]).
 -export([stop/0, stop/1]).
 
-% temporary for debugging
--include("deps/teaser/include/utils.hrl").
 % =================== specs, records, constants, defaults =======================
 
 % options accepted by start/1
