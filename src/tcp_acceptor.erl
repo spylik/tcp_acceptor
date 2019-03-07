@@ -4,9 +4,6 @@
 -export([start/0, start/1]).
 -export([stop/0, stop/1]).
 
-% export internal server-routine API
--export([server_loop/1]).
-
 % temporary for debugging
 -include("deps/teaser/include/utils.hrl").
 % =================== specs, records, constants, defaults =======================
@@ -35,7 +32,7 @@
         % port for listening
         {'PORT', 12000},
         % listen options "on init"
-        {'LISTEN_OPTIONS',  ['binary', {active, false}, {packet, 4}]},
+        {'LISTEN_OPTIONS',  ['binary', {active, false}, {packet, 4}, {reuseaddr, true}]},
         % function to handle frames and manipulate current receiver state
         {'HANDLER', fun dump_frame/3},
         % init value of connection state
@@ -83,7 +80,7 @@ start() -> start(#{}).
 
 start(Options) ->
     CompletedOps = assign_defaults(Options),
-    Pid = spawn(?MODULE, server_loop, [#state{options = CompletedOps}]),
+    Pid = spawn_link(fun() -> process_flag(trap_exit, true), server_loop(#state{options = CompletedOps}) end),
     RegName = maps:get('REG_NAME', CompletedOps),
     try register(RegName, Pid) of
         true ->
@@ -117,6 +114,7 @@ stop('undefined') -> ok;
 stop(RegisteredName) when is_atom(RegisteredName) ->
     stop(whereis(RegisteredName));
 stop(Pid) ->
+    unlink(Pid),
     MRef = erlang:monitor(process, Pid),
     exit(Pid, shutdown),
     receive
